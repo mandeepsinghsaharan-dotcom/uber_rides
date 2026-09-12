@@ -1,0 +1,167 @@
+select * from uber_trips;
+
+/*  1. Find the top 3 cities with the highest total completed revenue,
+       where the total completed trips in that city exceed 1,000. */
+
+SELECT 
+    city, 
+    COUNT(trip_id) AS completed_trips, 
+    ROUND(SUM(fare_amount)::numeric, 2) AS total_revenue
+FROM uber_trips
+WHERE status = 'Completed'
+GROUP BY city
+HAVING COUNT(trip_id) > 1000
+ORDER BY total_revenue DESC
+LIMIT 3;
+
+
+/*  2. Calculate the peak hour (0-23) for trip requests across all cities,
+       along with total revenue generated during that hour for completed rides.*/
+
+WITH HourlyStats AS (
+    SELECT 
+        EXTRACT(HOUR FROM CAST(pickup_time AS TIMESTAMP)) AS pickup_hour,
+        COUNT(trip_id) AS total_requests,
+        SUM(CASE WHEN status = 'Completed' THEN fare_amount ELSE 0 END) AS total_revenue
+    FROM uber_trips
+    GROUP BY EXTRACT(HOUR FROM CAST(pickup_time AS TIMESTAMP))
+)
+SELECT * 
+FROM HourlyStats
+ORDER BY total_requests DESC
+LIMIT 1;
+
+/*  3. Rank drivers in each city based on their total revenue generated from completed trips.*/
+
+WITH DriverRevenue AS (
+    SELECT 
+        city, 
+        driver_id, 
+        SUM(fare_amount) AS total_driver_revenue
+    FROM uber_trips
+    WHERE status = 'Completed'
+    GROUP BY city, driver_id
+)
+SELECT 
+    city, 
+    driver_id, 
+    total_driver_revenue,
+    DENSE_RANK() OVER (PARTITION BY city ORDER BY total_driver_revenue DESC) AS driver_rank
+FROM DriverRevenue;
+
+/*  4. Calculate the idle time (in minutes) for each driver
+       between the Drop Time of their previous trip and the Pickup Time of their next trip.*/
+
+WITH OrderedTrips AS (
+    SELECT 
+        driver_id,
+        trip_id,
+        drop_time,
+        pickup_time,
+        LAG(drop_time) OVER (PARTITION BY driver_id ORDER BY pickup_time) AS prev_drop_time
+    FROM uber_trips
+    WHERE status = 'Completed'
+)
+SELECT 
+    driver_id,
+    trip_id,
+    prev_drop_time,
+    pickup_time,
+    ROUND(EXTRACT(EPOCH FROM (CAST(pickup_time AS TIMESTAMP) - CAST(prev_drop_time AS TIMESTAMP))) / 60.0, 2) AS idle_time_minutes
+--EPOCH== is used to convert time difference into total seconds
+FROM OrderedTrips
+WHERE prev_drop_time IS NOT NULL;
+
+/*  5. Find the cancellation and no-show rates for each payment method.*/
+
+SELECT 
+    payment_method,
+    COUNT(trip_id) AS total_trips,
+    ROUND(100.0 * SUM(CASE WHEN status = 'Cancelled' THEN 1 ELSE 0 END) / COUNT(trip_id), 2) AS cancellation_rate_pct,
+    ROUND(100.0 * SUM(CASE WHEN status = 'No-Show' THEN 1 ELSE 0 END) / COUNT(trip_id), 2) AS noshow_rate_pct
+FROM uber_trips
+GROUP BY payment_method;
+
+/*  6. Calculate the daily cumulative revenue for each city
+       for completed trips during January 2023.*/
+
+WITH DailyRevenue AS (
+    SELECT 
+        city,
+        CAST(pickup_time AS DATE) AS trip_date,
+        ROUND(SUM(fare_amount)::numeric,2) AS daily_revenue
+    FROM uber_trips
+    WHERE status = 'Completed'
+    GROUP BY city, CAST(pickup_time AS DATE)
+)
+SELECT 
+    city,
+    trip_date,
+    daily_revenue,
+    SUM(daily_revenue) OVER (PARTITION BY city ORDER BY trip_date) AS cumulative_revenue
+FROM DailyRevenue;
+
+/*  7. Identify rider pairs who picked up
+       from the exact same pickup coordinates within 5 minutes of each other.*/
+
+SELECT 
+    t1.rider_id AS rider_1,
+    t2.rider_id AS rider_2,
+    t1.city,
+    t1.pickup_lat,
+    t1.pickup_lng,
+    t1.pickup_time AS rider_1_pickup,
+    t2.pickup_time AS rider_2_pickup
+FROM uber_trips t1
+JOIN uber_trips t2 
+    ON t1.pickup_lat = t2.pickup_lat 
+   AND t1.pickup_lng = t2.pickup_lng
+   AND t1.trip_id < t2.trip_id
+   AND ABS(EXTRACT(EPOCH FROM (CAST(t1.pickup_time AS TIMESTAMP) - CAST(t2.pickup_time AS TIMESTAMP)))) <= 300;
+
+/*  8. Calculate the average revenue per kilometer (Fare Amount / Distance) by trip distance tier
+       (Short: < 3 km, Medium: 3–10 km, Long: > 10 km).*/
+
+SELECT 
+    CASE 
+        WHEN "distance_km" < 3 THEN 'Short (<3 km)'
+        WHEN "distance_km" BETWEEN 3 AND 10 THEN 'Medium (3-10 km)'
+        ELSE 'Long (>10 km)'
+    END AS distance_category,
+    COUNT(trip_id) AS trip_count,
+    ROUND(AVG(fare_amount / NULLIF("distance_km", 0))::numeric, 2) AS avg_fare_per_km
+FROM uber_trips
+WHERE status = 'Completed'
+GROUP BY 1
+ORDER BY avg_fare_per_km DESC;
+
+/*  9. Find riders who have completed trips across
+       all 6 distinct cities present in the dataset.*/
+
+SELECT rider_id
+FROM uber_trips
+WHERE status = 'Completed'
+GROUP BY rider_id
+HAVING COUNT(DISTINCT city) = (SELECT COUNT(DISTINCT city) FROM uber_trips);
+
+/*  10.Divide completed trips into 4 fare quartiles per city and 
+       calculate the average total ride duration for each quartile.*/
+
+WITH QuartiledTrips AS (
+    SELECT 
+        city,
+        fare_amount,
+        "total ride time",
+        NTILE(4) OVER (PARTITION BY city ORDER BY fare_amount) AS fare_quartile
+    FROM uber_trips
+    WHERE status = 'Completed'
+)
+SELECT 
+    city,
+    fare_quartile,
+    MIN(fare_amount) AS min_fare,
+    MAX(fare_amount) AS max_fare,
+    COUNT(*) AS total_trips
+FROM QuartiledTrips
+GROUP BY city, fare_quartile
+ORDER BY city, fare_quartile;
